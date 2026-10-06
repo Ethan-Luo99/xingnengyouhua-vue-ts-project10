@@ -1,89 +1,158 @@
-<script>
-  import svelteLogo from './assets/svelte.svg'
-  import viteLogo from './assets/vite.svg'
-  import heroImg from './assets/hero.png'
-  import Counter from './lib/Counter.svelte'
+<script lang="ts">
+  import DataTable from './lib/DataTable.svelte'
+  import {
+    BOUND_FN_COUNT,
+    BOUND_FAST_IDS,
+    TOTAL_FUNCS,
+    buildInitialRows,
+  } from './lib/domain/functions'
+  import { SchedulerCoordinator } from './lib/scheduler/coordinator'
+
+  const initialRows = buildInitialRows()
+  const coordinator = new SchedulerCoordinator()
+
+  let table: DataTable
+  let text = $state('')
+  let composing = $state(false)
+  let progress = $state({ runId: 0, done: 0, total: 0, finished: false })
+
+  coordinator.setCommitSink((payload) => {
+    table?.applyCommit(payload)
+    progress = {
+      runId: payload.runId,
+      done: payload.doneCount,
+      total: payload.totalCount,
+      finished: payload.finished,
+    }
+  })
+
+  /** Trigger A: one click runs the entire graph. */
+  function runAll(): void {
+    coordinator.notifyInteraction()
+    coordinator.run()
+  }
+
+  /**
+   * Deterministic per-character subset for trigger B: a string hash selects a
+   * rotating slice of the 200 table-bound fast functions. Each keystroke runs
+   * exactly one scheduling round — there is no debounce.
+   */
+  function subsetFor(value: string): number[] {
+    let hash = 2166136261
+    for (let i = 0; i < value.length; i += 1) {
+      hash = Math.imul(hash ^ value.charCodeAt(i), 16777619)
+    }
+    const size = 40 + (Math.abs(hash) % 80)
+    const start = Math.abs(Math.imul(hash, 48271)) % BOUND_FN_COUNT
+    const nodes: number[] = []
+    for (let offset = 0; offset < size; offset += 1) {
+      const node = BOUND_FAST_IDS[(start + offset) % BOUND_FN_COUNT]
+      if (node !== undefined) nodes.push(node)
+    }
+    return nodes
+  }
+
+  function triggerB(value: string): void {
+    coordinator.notifyInteraction()
+    coordinator.run({ selectedNodes: subsetFor(value) })
+  }
+
+  function handleInput(event: Event): void {
+    const target = event.currentTarget as HTMLInputElement
+    text = target.value
+    // While an IME composition is active, intermediate glyphs are suppressed;
+    // the single round fires at compositionend (see handleCompositionEnd).
+    if (!composing) triggerB(text)
+  }
+
+  function handleCompositionStart(): void {
+    composing = true
+  }
+
+  function handleCompositionEnd(event: CompositionEvent): void {
+    composing = false
+    text = (event.currentTarget as HTMLInputElement).value
+    triggerB(text)
+  }
+
+  function handleScroll(scrollTop: number): void {
+    coordinator.notifyScroll(scrollTop)
+  }
 </script>
 
-<section id="center">
-  <div class="hero">
-    <img src={heroImg} class="base" width="170" height="179" alt="" />
-    <img src={svelteLogo} class="framework" alt="Svelte logo" />
-    <img src={viteLogo} class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/App.svelte</code> and save to test <code>HMR</code></p>
-  </div>
-  <Counter />
-</section>
+<main class="page">
+  <header>
+    <h1>DAG compute scheduler</h1>
+    <p>
+      {TOTAL_FUNCS} synthetic functions across 20 modules · 3 resident module
+      workers · 5000-row table
+    </p>
+  </header>
 
-<div class="ticks"></div>
+  <section class="controls">
+    <button type="button" onclick={runAll}>A — run all functions</button>
+    <input
+      type="text"
+      value={text}
+      placeholder="B — each character runs a subset"
+      oninput={handleInput}
+      oncompositionstart={handleCompositionStart}
+      oncompositionend={handleCompositionEnd}
+    />
+    <span class="progress">
+      {#if progress.runId > 0}
+        run #{progress.runId}: {progress.done}/{progress.total}
+        {progress.finished ? 'finished' : 'running'}
+      {/if}
+    </span>
+  </section>
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true">
-      <use href="/icons.svg#documentation-icon"></use>
-    </svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank" rel="noreferrer">
-          <img class="logo" src={viteLogo} alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://svelte.dev/" target="_blank" rel="noreferrer">
-          <img class="button-icon" src={svelteLogo} alt="" />
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true">
-      <use href="/icons.svg#social-icon"></use>
-    </svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li>
-        <a href="https://github.com/vitejs/vite" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#github-icon"></use>
-          </svg>
-          GitHub
-        </a>
-      </li>
-      <li>
-        <a href="https://chat.vite.dev/" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#discord-icon"></use>
-          </svg>
-          Discord
-        </a>
-      </li>
-      <li>
-        <a href="https://x.com/vite_js" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#x-icon"></use>
-          </svg>
-          X.com
-        </a>
-      </li>
-      <li>
-        <a href="https://bsky.app/profile/vite.dev" target="_blank" rel="noreferrer">
-          <svg class="button-icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#bluesky-icon"></use>
-          </svg>
-          Bluesky
-        </a>
-      </li>
-    </ul>
-  </div>
-</section>
+  <DataTable bind:this={table} rows={initialRows} onScroll={handleScroll} />
+</main>
 
-<div class="ticks"></div>
-<section id="spacer"></section>
+<style>
+  .page {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 16px;
+    text-align: left;
+  }
+
+  h1 {
+    font-size: 22px;
+    margin: 0 0 4px;
+  }
+
+  header p {
+    font-size: 13px;
+    color: #6b7280;
+    margin: 0 0 12px;
+  }
+
+  .controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+
+  .controls input {
+    flex: 1;
+    padding: 6px 10px;
+    font: inherit;
+    font-size: 14px;
+  }
+
+  .controls button {
+    padding: 6px 12px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  .progress {
+    font-size: 12px;
+    font-family: ui-monospace, Consolas, monospace;
+    min-width: 150px;
+  }
+</style>
