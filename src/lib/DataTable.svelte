@@ -9,11 +9,17 @@
   interface Props {
     rows: readonly TableRow[]
     onScroll?: (scrollTop: number) => void
+    /**
+     * Single-node retry hook: invoked with the bound nodeId when the user
+     * activates the retry affordance on an error row. Wired to the
+     * coordinator's existing single-node run path (no new commit path).
+     */
+    onRetryNode?: (nodeId: number) => void
   }
 
   import { untrack } from 'svelte'
 
-  let { rows, onScroll }: Props = $props()
+  let { rows, onScroll, onRetryNode }: Props = $props()
 
   /**
    * $state.raw holds the 5000 rows as immutable snapshots: Svelte never
@@ -57,6 +63,16 @@
     const target = event.currentTarget as HTMLDivElement
     onScroll?.(target.scrollTop)
   }
+
+  /**
+   * Retry entry point for an errored bound node. The node id is parsed from
+   * the stable `fn-<index>` binding; rows without a binding have no retry.
+   */
+  function retryRow(row: TableRow): void {
+    if (row.status !== 'error' || !row.boundFnId || !onRetryNode) return
+    const nodeId = Number(row.boundFnId.slice(3))
+    if (Number.isInteger(nodeId)) onRetryNode(nodeId)
+  }
 </script>
 
 <div class="table-scroller" bind:this={scroller} onscroll={handleScroll}>
@@ -89,7 +105,21 @@
           <td class="mono">{row.rowId}</td>
           <td class="mono">{row.boundFnId ?? '—'}</td>
           <td>m{row.moduleId}</td>
-          <td>{row.status}</td>
+          <td>
+            {#if row.status === 'error' && row.boundFnId !== null && onRetryNode}
+              <button
+                type="button"
+                class="retry-button"
+                title={`Retry ${row.boundFnId}`}
+                aria-label={`Retry ${row.boundFnId}`}
+                onclick={() => retryRow(row)}
+              >
+                error ↻
+              </button>
+            {:else}
+              {row.status}
+            {/if}
+          </td>
           <td class="mono value">
             {row.value === null ? '—' : row.value.toFixed(3)}
           </td>
@@ -156,6 +186,22 @@
 
   .data-row.error {
     color: #b42318;
+  }
+
+  .retry-button {
+    font: inherit;
+    font-size: 11px;
+    padding: 1px 6px;
+    color: #b42318;
+    background: transparent;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .retry-button:hover {
+    background: #b42318;
+    color: #fff;
   }
 
   .mono {

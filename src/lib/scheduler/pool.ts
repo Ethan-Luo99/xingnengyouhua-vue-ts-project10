@@ -26,14 +26,16 @@ import {
   type FunctionSpec,
 } from '../domain/functions'
 import {
+  BinaryProtocolError,
+  decodeResultBatch,
   ownBuffer,
-  receiveResult,
   takeTransfers,
   type BatchOutput,
+  type BinaryBatchOutput,
   type MainToWorker,
   type NodeId,
   type RunId,
-  type TaskError,
+  type WorkerToMain,
   type WorkerId,
 } from './protocol'
 
@@ -43,7 +45,9 @@ export interface PoolOutcome {
   readonly kind: PoolOutcomeKind
   readonly runId: RunId
   readonly nodeId: NodeId
-  /** Fresh ArrayBuffer on `result` (main thread is the sole owner). */
+  /** Decoded scalar on `result` (the transfer buffer is already released). */
+  readonly value?: number
+  /** Kept for backwards-compatible callers; absent on the binary path. */
   readonly output?: ArrayBuffer
   readonly computeMs?: number
   readonly error?: { readonly name: string; readonly message: string }
@@ -64,6 +68,13 @@ interface WorkerSlot {
 }
 
 const MAX_WORKERS = 3
+/**
+ * Consecutive worker-death threshold: only after this many slot crashes in a
+ * row (with no intervening healthy worker response) does the pool give up on
+ * workers entirely and flip to main-thread fallback. Below the threshold a
+ * dead worker is transparently replaced and its in-flight task re-enqueued.
+ */
+const CONSECUTIVE_CRASH_LIMIT = 3
 const MEDIUM_ADMIT_QUIET_MS = 16
 const LONG_ADMIT_QUIET_MS = 80
 
@@ -93,12 +104,47 @@ export class ComputePool {
   private fallbackDraining = false
   private lastInteractionAt = 0
   private warmStarted = false
+  /**
+   * Idempotency ledger: `${runId}:${nodeId}` of every terminal outcome this
+   * pool has already emitted for the worker path. If a crashed worker's
+   * result was in fact delivered right before the crash (the re-run race),
+   * the replacement's duplicate outcome is swallowed here. Main-thread
+   * fallback emits before a task is forgotten and stays a single executor, so
+   * it cannot duplicate; the ledger therefore only guards worker deliveries.
+   */
+  private readonly deliveredKeys = new Set<string>()
+  /** Worker deaths since the last healthy worker delivery. */
+  private consecutiveCrashes = 0
+  private runPriority: (runId: RunId) => number = () => 0
 
   constructor(private readonly specs: readonly FunctionSpec[] = FUNCTIONS) {}
 
   /** Input/scroll activity notification used by fallback admission gating. */
   notifyInteraction(): void {
     this.lastInteractionAt = performance.now()
+  }
+
+  /**
+   * Wake the dispatch pump without submitting anything. Used when a paused
+   * run is resumed: its worker tasks may all be sitting in the queue with no
+   * slot-completion event imminent (e.g. a freshly replaced worker that
+   * already said ready while the run was paused), so this closes the
+   * otherwise-harmless lost-wakeup race.
+   */
+  kick(): void {
+    if (this.fallbackMode) this.drainFallbackQueue()
+    else this.pumpQueued()
+  }
+
+  /**
+   * Live-run priority hook supplied by the coordinator: returns 0 for the
+   * foreground run, 1 for a paused-but-live run, and >=2 for unknown/retired
+   * runs. The FIFO queue is otherwise fair, but a foreground B must not be
+   * stuck behind A tasks that were enqueued before the pause, and retired
+   * runs' leftovers must not occupy slots at all. Lower wins; ties keep FIFO.
+   */
+  setRunPriority(probe: (runId: RunId) => number): void {
+    this.runPriority = probe
   }
 
   get isFallback(): boolean {
@@ -142,11 +188,23 @@ export class ComputePool {
         type: 'module',
         name: `compute-${id}`,
       })
-      worker.onmessage = (event: MessageEvent<BatchOutput | { kind: 'ready' }>) => {
-        if (event.data.kind === 'ready') return
-        this.handleBatch(event.data, id)
+      worker.onmessage = (event: MessageEvent<WorkerToMain>) => {
+        if (event.data.kind === 'ready') {
+          // A live replacement resetting the crash streak happens here, not
+          // on construction, so a worker that dies instantly still counts.
+          this.consecutiveCrashes = 0
+          this.pumpQueued()
+          return
+        }
+        if (event.data.kind === 'binaryBatch') {
+          this.handleBinaryBatch(event.data, id)
+        } else {
+          this.handleBatch(event.data, id)
+        }
       }
-      worker.onerror = () => this.killSlot(id)
+      // onerror covers an uncaught worker exception or a dead runtime; the
+      // task's result is presumed lost, so self-heal by replacing the slot.
+      worker.onerror = () => this.killAndReplaceSlot(id)
       this.slots.push({ id, worker, busy: false, current: null })
       return true
     } catch {
@@ -155,7 +213,12 @@ export class ComputePool {
     }
   }
 
-  private killSlot(id: WorkerId): void {
+  /**
+   * Tear down a dead slot, re-enqueue its in-flight task, and either spawn a
+   * replacement (the normal self-heal path) or degrade wholesale once the
+   * consecutive-crash threshold is exceeded.
+   */
+  private killAndReplaceSlot(id: WorkerId): void {
     const slot = this.slots.find((entry) => entry.id === id)
     if (!slot) return
     try {
@@ -165,11 +228,26 @@ export class ComputePool {
     }
     const index = this.slots.indexOf(slot)
     if (index >= 0) this.slots.splice(index, 1)
+    this.consecutiveCrashes += 1
     if (slot.current) {
+      // Re-run from the same coordinates: runId+nodeId are unchanged, which
+      // is exactly what the idempotency ledger keys on. Duplicate delivery
+      // is impossible if the original result arrives late (or already did);
+      // only a genuinely undelivered task reaches the handler twice.
       this.queued.push(slot.current)
       slot.current = null
     }
-    if (this.slots.length === 0) this.enterFallback()
+    if (this.consecutiveCrashes >= CONSECUTIVE_CRASH_LIMIT) {
+      this.enterFallback()
+      return
+    }
+    // Same slot id: nothing in the coordinator ever identifies workers by
+    // object identity, only by the stable index.
+    if (!this.createWorker(id)) {
+      // Construction failure flips fallback outright.
+      return
+    }
+    this.pumpQueued()
   }
 
   private enterFallback(): void {
@@ -198,19 +276,78 @@ export class ComputePool {
     if (idleSlot) {
       this.postTask(idleSlot, { runId, nodeId })
     } else if (this.slots.length < targetPoolSize()) {
-      const id = this.slots.length
-      if (this.createWorker(id)) {
-        const slot = this.slots[id]
+      const id = this.missingSlotId()
+      if (id === null) {
+        this.queued.push({ runId, nodeId })
+      } else if (this.createWorker(id)) {
+        const slot = this.slots.find((entry) => entry.id === id)
         if (slot) this.postTask(slot, { runId, nodeId })
-        return true
+        else this.queued.push({ runId, nodeId })
+      } else {
+        // Construction failed: enterFallback() already flipped the mode.
+        this.queued.push({ runId, nodeId })
+        this.drainFallbackQueue()
       }
-      // Construction failed: enterFallback() already flipped the mode.
-      this.queued.push({ runId, nodeId })
-      this.drainFallbackQueue()
     } else {
       this.queued.push({ runId, nodeId })
     }
     return true
+  }
+
+  /** Lowest stable slot index without a live worker, or null when full. */
+  private missingSlotId(): WorkerId | null {
+    for (let id = 0; id < targetPoolSize(); id += 1) {
+      if (!this.slots.some((slot) => slot.id === id)) return id
+    }
+    return null
+  }
+
+  /** Hand queued entries to every idle live slot. */
+  private pumpQueued(): void {
+    if (this.fallbackMode) return
+    for (const slot of this.slots) {
+      if (slot.busy) continue
+      const entry = this.takeNextQueued()
+      if (entry) this.postTask(slot, entry)
+    }
+  }
+
+  /**
+   * Remove and return the highest-priority queued entry. Retired runs are
+   * dropped (stale notice emitted so their accounting closes); among the
+   * remainder the foreground run wins over a paused live run, FIFO breaking
+   * ties. Scanning the queue is bounded by its own length and a pump runs at
+   * most once per freed slot, so total scan work stays proportional to
+   * enqueue/dequeue volume.
+   */
+  private takeNextQueued(): PendingEntry | null {
+    let bestIndex = -1
+    let bestPriority = Number.POSITIVE_INFINITY
+    for (let index = 0; index < this.queued.length; index += 1) {
+      const entry = this.queued[index]
+      if (!entry) continue
+      if (this.cancelledRuns.has(entry.runId)) {
+        this.queued.splice(index, 1)
+        this.emit({ kind: 'stale', runId: entry.runId, nodeId: entry.nodeId })
+        return this.takeNextQueued()
+      }
+      const priority = this.runPriority(entry.runId)
+      if (priority < bestPriority) {
+        bestPriority = priority
+        bestIndex = index
+      }
+    }
+    if (bestIndex < 0) return null
+    if (bestPriority >= 2) {
+      // Nothing live remains in the queue; retire every leftover entry so it
+      // cannot pin a slot after a future kick.
+      for (const dead of this.queued.splice(0)) {
+        this.emit({ kind: 'stale', runId: dead.runId, nodeId: dead.nodeId })
+      }
+      return null
+    }
+    const [entry] = this.queued.splice(bestIndex, 1)
+    return entry ?? null
   }
 
   private postTask(slot: WorkerSlot, entry: PendingEntry): void {
@@ -231,13 +368,7 @@ export class ComputePool {
   private freeSlot(slot: WorkerSlot): void {
     slot.busy = false
     slot.current = null
-    while (this.queued.length > 0) {
-      const entry = this.queued.shift()
-      if (!entry) break
-      if (this.cancelledRuns.has(entry.runId)) continue
-      this.postTask(slot, entry)
-      return
-    }
+    this.pumpQueued()
   }
 
   private handleBatch(batch: BatchOutput, workerId: WorkerId): void {
@@ -246,25 +377,27 @@ export class ComputePool {
     for (const result of batch.results) {
       touchedNodes.add(result.nodeId)
       if (this.cancelledRuns.has(result.runId)) continue
-      const received = receiveResult(result)
-      this.emit({
-        kind: 'result',
-        runId: received.runId,
-        nodeId: received.nodeId,
-        output: received.output,
-        computeMs: received.computeMs,
-      })
+      if (this.markDelivered(result.runId, result.nodeId)) {
+        this.emit({
+          kind: 'result',
+          runId: result.runId,
+          nodeId: result.nodeId,
+          output: result.output as unknown as ArrayBuffer,
+          computeMs: result.computeMs,
+        })
+      }
     }
     for (const error of batch.errors) {
       touchedNodes.add(error.nodeId)
       if (this.cancelledRuns.has(error.runId)) continue
-      const dto: TaskError = error
-      this.emit({
-        kind: 'error',
-        runId: dto.runId,
-        nodeId: dto.nodeId,
-        error: dto.error,
-      })
+      if (this.markDelivered(error.runId, error.nodeId)) {
+        this.emit({
+          kind: 'error',
+          runId: error.runId,
+          nodeId: error.nodeId,
+          error: error.error,
+        })
+      }
     }
     for (const notice of batch.stale) {
       touchedNodes.add(notice.nodeId)
@@ -281,6 +414,90 @@ export class ComputePool {
         this.freeSlot(slot)
       }
     }
+  }
+
+  /**
+   * Decode the single transferred payload, emit plain scalar outcomes, and
+   * let the buffer go out of scope (ownership released immediately — it is
+   * never retained, copied into a view, or re-posted). A malformed payload is
+   * treated as a worker fault for this slot rather than risking half a batch.
+   */
+  private handleBinaryBatch(batch: BinaryBatchOutput, workerId: WorkerId): void {
+    const slot = this.slots.find((entry) => entry.id === workerId)
+    const touchedNodes = new Set<NodeId>()
+    try {
+      const decoded = decodeResultBatch(
+        batch.payload as unknown as ArrayBuffer,
+      )
+      if (decoded.runId !== batch.runId) {
+        throw new BinaryProtocolError(
+          `envelope runId ${batch.runId} != header runId ${decoded.runId}`,
+        )
+      }
+      for (const result of decoded.results) {
+        touchedNodes.add(result.nodeId)
+        if (this.cancelledRuns.has(decoded.runId)) continue
+        if (this.markDelivered(decoded.runId, result.nodeId)) {
+          this.emit({
+            kind: 'result',
+            runId: decoded.runId,
+            nodeId: result.nodeId,
+            value: result.value,
+            computeMs: result.computeMs,
+          })
+        }
+      }
+    } catch (error) {
+      if (error instanceof BinaryProtocolError) {
+        // Structural corruption: abandon this slot's task entirely so no
+        // partial batch can be committed; the slot is healed like a crash.
+        if (slot?.current) touchedNodes.add(slot.current.nodeId)
+        this.killAndReplaceSlot(workerId)
+        return
+      }
+      throw error
+    }
+    for (const error of batch.errors) {
+      touchedNodes.add(error.nodeId)
+      if (this.cancelledRuns.has(error.runId)) continue
+      if (this.markDelivered(error.runId, error.nodeId)) {
+        this.emit({
+          kind: 'error',
+          runId: error.runId,
+          nodeId: error.nodeId,
+          error: error.error,
+        })
+      }
+    }
+    for (const notice of batch.stale) {
+      touchedNodes.add(notice.nodeId)
+      this.emit({
+        kind: 'stale',
+        runId: notice.runId,
+        nodeId: notice.nodeId,
+      })
+    }
+    if (
+      slot &&
+      slot.current &&
+      touchedNodes.has(slot.current.nodeId)
+    ) {
+      this.freeSlot(slot)
+    }
+  }
+
+  /**
+   * First-terminal-outcome wins ledger. Returns false when this run+node was
+   * already emitted, which is exactly the crash/re-run race: the original
+   * task actually delivered before dying and the replacement's result is the
+   * duplicate. Cancelled deliveries never record a key, so a genuine retry
+   * under a NEW runId is never affected (keys include the runId).
+   */
+  private markDelivered(runId: RunId, nodeId: NodeId): boolean {
+    const key = `${runId}:${nodeId}`
+    if (this.deliveredKeys.has(key)) return false
+    this.deliveredKeys.add(key)
+    return true
   }
 
   /** Best-effort cancel: flips adoption flags, never interrupts in-flight sync. */
@@ -300,6 +517,10 @@ export class ComputePool {
   /** Forget cancellation bookkeeping for a run whose retirement is complete. */
   purgeRun(runId: RunId): void {
     this.cancelledRuns.delete(runId)
+    const prefix = `${runId}:`
+    for (const key of this.deliveredKeys) {
+      if (key.startsWith(prefix)) this.deliveredKeys.delete(key)
+    }
   }
 
   /* ---------------- main-thread fallback ---------------- */

@@ -78,6 +78,15 @@
   function handleScroll(scrollTop: number): void {
     coordinator.notifyScroll(scrollTop)
   }
+
+  /**
+   * Error-cell retry: goes through the same coordinator run path as B (a
+   * single-node subset run under a fresh runId), so it can pause an A run
+   * cooperatively but never mutates an in-flight run's node set.
+   */
+  function handleRetryNode(nodeId: number): void {
+    coordinator.retryNode(nodeId)
+  }
 </script>
 
 <main class="page">
@@ -107,7 +116,12 @@
     </span>
   </section>
 
-  <DataTable bind:this={table} rows={initialRows} onScroll={handleScroll} />
+  <DataTable
+    bind:this={table}
+    rows={initialRows}
+    onScroll={handleScroll}
+    onRetryNode={handleRetryNode}
+  />
 </main>
 
 <style>
