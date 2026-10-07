@@ -78,6 +78,16 @@
   function handleScroll(scrollTop: number): void {
     coordinator.notifyScroll(scrollTop)
   }
+
+  /**
+   * Error-cell retry. The scheduler mints a dedicated repair runId, so this
+   * neither allocates a B "keystroke round" nor shares a runId with any run
+   * already in flight.
+   */
+  function retryNode(nodeId: number): void {
+    coordinator.notifyInteraction()
+    coordinator.run({ repairNode: nodeId })
+  }
 </script>
 
 <main class="page">
@@ -107,7 +117,12 @@
     </span>
   </section>
 
-  <DataTable bind:this={table} rows={initialRows} onScroll={handleScroll} />
+  <DataTable
+    bind:this={table}
+    rows={initialRows}
+    onScroll={handleScroll}
+    onRetryNode={retryNode}
+  />
 </main>
 
 <style>

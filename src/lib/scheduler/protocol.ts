@@ -14,10 +14,164 @@
  * be) transferred. Buffers enter the ownership system once via `ownBuffer()`
  * and leave it exactly once via `takeTransfers()`; the receiving side gets a
  * plain, freshly-owned `ArrayBuffer` back from `receive*()`.
+ *
+ * Zero-copy batch channel (v1 binary layout, little-endian, fixed-width)
+ * ---------------------------------------------------------------------
+ * A whole batch of successful results is encoded by the worker into ONE
+ * ArrayBuffer and transferred once (`BatchBinaryOutput.payload`) instead of
+ * transferring one buffer per result. `errors` and `stale` remain narrow,
+ * structured-cloned DTOs. Byte offsets:
+ *
+ *   header (16 bytes)
+ *     0  u32  magic   = 0x44414731 (ASCII 'DAG1' in little-endian byte order)
+ *     4  u32  protocolVersion (PROTOCOL_VERSION)
+ *     8  u32  entryCount
+ *     12 u32  runId           (one batch encodes a SINGLE run)
+ *
+ *   each entry (24 bytes, 8-byte aligned)
+ *     0  u32  nodeId
+ *     4  u8   status         (ENTRY_STATUS_DONE = 1 in v1; errors go via DTO)
+ *     5  3 bytes reserved, MUST be zero
+ *     8  f64  value          (the decoded scalar, little-endian IEEE-754)
+ *     16 f64  computeMs      (little-endian IEEE-754)
+ *
+ * Total byte length MUST equal BINARY_HEADER_BYTES + entryCount *
+ * BINARY_ENTRY_BYTES. Every multi-byte field is read/written with the
+ * little-endian flag set; there is no endianness negotiation.
  */
 
 /** Protocol version; bump when the wire shape changes. */
 export const PROTOCOL_VERSION = 1 as const
+
+/* ---- zero-copy batch wire constants (all numbers are little-endian) ---- */
+
+/** Bytes 0..3 spell ASCII 'DAG1' when stored little-endian. */
+export const BINARY_BATCH_MAGIC = 0x44414731 as const
+/** Fixed header width in bytes. */
+export const BINARY_HEADER_BYTES = 16 as const
+/** Fixed per-entry width in bytes (8-byte aligned). */
+export const BINARY_ENTRY_BYTES = 24 as const
+/** Entry status byte: v1 only ever encodes successful, adopted results. */
+export const ENTRY_STATUS_DONE = 1 as const
+
+/** Thrown when a transferred batch buffer fails structural validation. */
+export class BatchDecodeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BatchDecodeError'
+  }
+}
+
+/** One decoded batch entry; only plain numbers survive the decode. */
+export interface DecodedResultEntry {
+  readonly nodeId: NodeId
+  readonly status: typeof ENTRY_STATUS_DONE
+  readonly value: number
+  readonly computeMs: number
+}
+
+/** Worker-side input shape for {@link encodeResultBatch}. */
+export interface EncodableResultEntry {
+  readonly nodeId: NodeId
+  readonly value: number
+  readonly computeMs: number
+}
+
+/**
+ * Encode one run's successful results into a single owned buffer. Pure and
+ * isomorphic (usable from both worker and main thread); uses DataView with
+ * explicit little-endian accessors and reserves padding bytes as zero.
+ */
+export function encodeResultBatch(
+  runId: RunId,
+  entries: readonly EncodableResultEntry[],
+): OwnedArrayBuffer {
+  const buffer = new ArrayBuffer(
+    BINARY_HEADER_BYTES + entries.length * BINARY_ENTRY_BYTES,
+  )
+  const view = new DataView(buffer)
+  view.setUint32(0, BINARY_BATCH_MAGIC, true)
+  view.setUint32(4, PROTOCOL_VERSION, true)
+  view.setUint32(8, entries.length, true)
+  view.setUint32(12, runId, true)
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
+    if (!entry) continue
+    const offset = BINARY_HEADER_BYTES + index * BINARY_ENTRY_BYTES
+    view.setUint32(offset, entry.nodeId, true)
+    view.setUint8(offset + 4, ENTRY_STATUS_DONE)
+    view.setUint8(offset + 5, 0)
+    view.setUint8(offset + 6, 0)
+    view.setUint8(offset + 7, 0)
+    view.setFloat64(offset + 8, entry.value, true)
+    view.setFloat64(offset + 16, entry.computeMs, true)
+  }
+  return ownBuffer(buffer)
+}
+
+/**
+ * Decode a transferred batch buffer into plain numbers and release it: no
+ * view on the buffer is retained, so it becomes garbage immediately after the
+ * call returns. Every structural assumption is validated up front against the
+ * byte length, which makes all later DataView reads provably in-bounds; a
+ * malformed buffer (bad magic/version/status/reserved or an entryCount that
+ * disagrees with byteLength) raises {@link BatchDecodeError} and the caller is
+ * expected to discard the buffer and treat the sender as poisoned.
+ */
+export function decodeResultBatch(buffer: ArrayBuffer): {
+  readonly protocolVersion: number
+  readonly runId: RunId
+  readonly entries: readonly DecodedResultEntry[]
+} {
+  const byteLength = buffer.byteLength
+  if (byteLength < BINARY_HEADER_BYTES) {
+    throw new BatchDecodeError(
+      `batch shorter than header: ${byteLength} < ${BINARY_HEADER_BYTES}`,
+    )
+  }
+  const view = new DataView(buffer)
+  const magic = view.getUint32(0, true)
+  if (magic !== BINARY_BATCH_MAGIC) {
+    throw new BatchDecodeError(`bad batch magic: 0x${magic.toString(16)}`)
+  }
+  const protocolVersion = view.getUint32(4, true)
+  if (protocolVersion !== PROTOCOL_VERSION) {
+    throw new BatchDecodeError(`unsupported batch protocol version: ${protocolVersion}`)
+  }
+  const entryCount = view.getUint32(8, true)
+  const expectedLength =
+    BINARY_HEADER_BYTES + entryCount * BINARY_ENTRY_BYTES
+  // Exact equality: an entryCount inconsistent with the buffer length means a
+  // truncated or corrupted transfer; reject before indexing any entry.
+  if (byteLength !== expectedLength) {
+    throw new BatchDecodeError(
+      `batch length ${byteLength} disagrees with entryCount ${entryCount} (expected ${expectedLength})`,
+    )
+  }
+  const runId = view.getUint32(12, true)
+  const entries: DecodedResultEntry[] = []
+  for (let index = 0; index < entryCount; index += 1) {
+    const offset = BINARY_HEADER_BYTES + index * BINARY_ENTRY_BYTES
+    const status = view.getUint8(offset + 4)
+    if (status !== ENTRY_STATUS_DONE) {
+      throw new BatchDecodeError(`unknown entry status byte ${status} at index ${index}`)
+    }
+    if (
+      view.getUint8(offset + 5) !== 0 ||
+      view.getUint8(offset + 6) !== 0 ||
+      view.getUint8(offset + 7) !== 0
+    ) {
+      throw new BatchDecodeError(`non-zero reserved bytes at index ${index}`)
+    }
+    entries.push({
+      nodeId: view.getUint32(offset, true),
+      status: ENTRY_STATUS_DONE,
+      value: view.getFloat64(offset + 8, true),
+      computeMs: view.getFloat64(offset + 16, true),
+    })
+  }
+  return { protocolVersion, runId, entries }
+}
 
 /** Monotonic coordinator run id (each click / each keystroke allocates one). */
 export type RunId = number
@@ -118,14 +272,29 @@ export interface BatchOutput {
   readonly stale: readonly StaleNotice[]
 }
 
-export type WorkerToMain = ReadyOutput | BatchOutput
+/**
+ * Zero-copy batch envelope: all successful results of ONE run are encoded in
+ * a single transferred ArrayBuffer (see file header for the binary layout).
+ * `errors` and `stale` stay narrow plain DTOs.
+ */
+export interface BatchBinaryOutput {
+  readonly kind: 'batch-binary'
+  /** TRANSFERRED worker -> main; exactly one transfer per batch. */
+  readonly payload: OwnedArrayBuffer
+  readonly errors: readonly TaskError[]
+  readonly stale: readonly StaleNotice[]
+}
+
+export type WorkerToMain = ReadyOutput | BatchOutput | BatchBinaryOutput
 
 /**
  * Extract the transfer list from an outbound message. Consuming the owned
  * buffers requires mapping the opaque type to `Transferable`; this is the
  * single sanctioned place where that conversion happens.
  */
-export function takeTransfers(message: MainToWorker | BatchOutput): Transferable[] {
+export function takeTransfers(
+  message: MainToWorker | BatchOutput | BatchBinaryOutput,
+): Transferable[] {
   if (message.kind === 'task') {
     return [message.input as unknown as Transferable]
   }
@@ -134,7 +303,28 @@ export function takeTransfers(message: MainToWorker | BatchOutput): Transferable
       (result) => result.output as unknown as Transferable,
     )
   }
+  if (message.kind === 'batch-binary') {
+    return [message.payload as unknown as Transferable]
+  }
   return []
+}
+
+/**
+ * Main-side: unwrap a transferred binary batch after the transfer. The
+ * returned `payload` is a plain ArrayBuffer of which the receiver is the sole
+ * owner; decode it once with {@link decodeResultBatch} and drop the reference
+ * so ownership is released immediately.
+ */
+export function receiveBatchBinary(message: BatchBinaryOutput): {
+  payload: ArrayBuffer
+  errors: readonly TaskError[]
+  stale: readonly StaleNotice[]
+} {
+  return {
+    payload: message.payload as unknown as ArrayBuffer,
+    errors: message.errors,
+    stale: message.stale,
+  }
 }
 
 /**

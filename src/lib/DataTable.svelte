@@ -6,14 +6,16 @@
   } from './domain/functions'
   import type { CommitPayload } from './scheduler/coordinator'
 
-  interface Props {
-    rows: readonly TableRow[]
-    onScroll?: (scrollTop: number) => void
-  }
+interface Props {
+  rows: readonly TableRow[]
+  onScroll?: (scrollTop: number) => void
+  /** Error-cell retry hook; receives the node id (function index) to rerun. */
+  onRetryNode?: (nodeId: number) => void
+}
 
-  import { untrack } from 'svelte'
+import { untrack } from 'svelte'
 
-  let { rows, onScroll }: Props = $props()
+  let { rows, onScroll, onRetryNode }: Props = $props()
 
   /**
    * $state.raw holds the 5000 rows as immutable snapshots: Svelte never
@@ -57,6 +59,16 @@
     const target = event.currentTarget as HTMLDivElement
     onScroll?.(target.scrollTop)
   }
+
+  /**
+   * Error-row retry: clicking the status/value cell of an error row reruns
+   * that single bound node through the existing scheduler (repair sidecar).
+   * Done and pending cells are inert, so there is no alternate submit path.
+   */
+  function retryCell(row: TableRow): void {
+    if (row.status !== 'error' || row.boundFnId === null) return
+    onRetryNode?.(Number(row.boundFnId.slice(3)))
+  }
 </script>
 
 <div class="table-scroller" bind:this={scroller} onscroll={handleScroll}>
@@ -89,8 +101,47 @@
           <td class="mono">{row.rowId}</td>
           <td class="mono">{row.boundFnId ?? '—'}</td>
           <td>m{row.moduleId}</td>
-          <td>{row.status}</td>
-          <td class="mono value">
+          <td
+            class="status-cell"
+            class:retryable={row.status === 'error' && row.boundFnId !== null}
+            role={row.status === 'error' ? 'button' : undefined}
+            tabindex={row.status === 'error' ? 0 : undefined}
+            title={
+              row.status === 'error' && row.boundFnId !== null
+                ? 'Click to retry this node'
+                : undefined
+            }
+            onclick={() => retryCell(row)}
+            onkeydown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                retryCell(row)
+              }
+            }}
+          >
+            {row.status}
+            {#if row.status === 'error' && row.boundFnId !== null}
+              <span class="retry-hint" aria-hidden="true"> ↻</span>
+            {/if}
+          </td>
+          <td
+            class="mono value"
+            class:retryable={row.status === 'error' && row.boundFnId !== null}
+            role={row.status === 'error' ? 'button' : undefined}
+            tabindex={row.status === 'error' ? 0 : undefined}
+            title={
+              row.status === 'error' && row.boundFnId !== null
+                ? 'Click to retry this node'
+                : undefined
+            }
+            onclick={() => retryCell(row)}
+            onkeydown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                retryCell(row)
+              }
+            }}
+          >
             {row.value === null ? '—' : row.value.toFixed(3)}
           </td>
           <td>
@@ -156,6 +207,28 @@
 
   .data-row.error {
     color: #b42318;
+  }
+
+  .status-cell.retryable,
+  .value.retryable {
+    cursor: pointer;
+    border-radius: 3px;
+  }
+
+  .status-cell.retryable:hover,
+  .value.retryable:hover {
+    background: rgba(180, 35, 24, 0.1);
+    text-decoration: underline;
+  }
+
+  .status-cell.retryable:focus-visible,
+  .value.retryable:focus-visible {
+    outline: 2px solid #b42318;
+    outline-offset: -2px;
+  }
+
+  .retry-hint {
+    font-weight: 700;
   }
 
   .mono {
